@@ -24,7 +24,9 @@
 
 
 #define UDP_MAX_DATAGRAM_SIZE 8192
-
+#ifndef LUA_TCDATA
+#define LUA_TCDATA 10
+#endif
 
 static int ngx_stream_lua_socket_udp(lua_State *L);
 static int ngx_stream_lua_socket_udp_setpeername(lua_State *L);
@@ -967,9 +969,10 @@ ngx_stream_lua_socket_udp_send(lua_State *L)
     ngx_str_t                             query;
     ngx_stream_lua_srv_conf_t            *lscf;
 
-    if (lua_gettop(L) != 2) {
-        return luaL_error(L, "expecting 2 arguments (including the object), "
-                          "but got %d", lua_gettop(L));
+    int nargs = lua_gettop(L);
+    if (nargs != 2 && nargs != 3) {
+        return luaL_error(L, "expecting 2 - 3 arguments (including the object), "
+                          "but got %d", nargs);
     }
 
     s = ngx_stream_lua_get_session(L);
@@ -1015,7 +1018,12 @@ ngx_stream_lua_socket_udp_send(lua_State *L)
     switch (type) {
         case LUA_TNUMBER:
         case LUA_TSTRING:
-            lua_tolstring(L, 2, &len);
+        case LUA_TCDATA:
+            if (nargs == 3 && !lua_isnumber(L, 3)) {
+                msg = lua_pushfstring(L, "number expected, got %s",
+                                      lua_typename(L, lua_type(L, 3)));
+                return luaL_argerror(L, 3, msg);
+            }
             break;
 
         case LUA_TTABLE:
@@ -1030,17 +1038,32 @@ ngx_stream_lua_socket_udp_send(lua_State *L)
             return luaL_argerror(L, 2, msg);
     }
 
-    query.data = lua_newuserdata(L, len);
-    query.len = len;
+    query.data = NULL;
+    query.len = 0;
 
     switch (type) {
         case LUA_TNUMBER:
         case LUA_TSTRING:
-            p = (u_char *) lua_tolstring(L, 2, &len);
-            ngx_memcpy(query.data, (u_char *) p, len);
+        case LUA_TCDATA:
+            if (nargs == 3 && type == LUA_TCDATA) {
+                p = *(u_char **) lua_topointer(L, 2);
+                len = ngx_min(len, lua_tointeger(L, 3));
+            } else {
+                p = (u_char *) lua_tolstring(L, 2, &len);
+            }
+            /* fast path: message sent without blocking, no need to copy */
+            n = ngx_udp_send(u->udp_connection.connection, p, len);
+            if (n != len) {
+                ngx_stream_lua_assert(n <= 0); /* datagram sockets do not have partial writes */
+                query.data = lua_newuserdata(L, len);
+                query.len = len;
+                ngx_memcpy(query.data, (u_char *) p, len);
+            }
             break;
 
         case LUA_TTABLE:
+            query.data = lua_newuserdata(L, len);
+            query.len = len;
             (void) ngx_stream_lua_copy_str_in_table(L, 2, query.data);
             break;
 
@@ -1056,11 +1079,13 @@ ngx_stream_lua_socket_udp_send(lua_State *L)
     u->waiting = 0;
 #endif
 
-    dd("sending query %.*s", (int) query.len, query.data);
+    if (query.len > 0) {
+        dd("sending query %.*s", (int) query.len, query.data);
 
-    n = ngx_udp_send(u->udp_connection.connection, query.data, query.len);
+        n = ngx_udp_send(u->udp_connection.connection, query.data, query.len);
 
-    dd("ngx_send returns %d (query len %d)", (int) n, (int) query.len);
+        dd("ngx_send returns %d (query len %d)", (int) n, (int) query.len);
+    }
 
     if (n == NGX_ERROR || n == NGX_AGAIN) {
         u->socket_errno = ngx_socket_errno;
@@ -1068,7 +1093,7 @@ ngx_stream_lua_socket_udp_send(lua_State *L)
         return ngx_stream_lua_socket_error_retval_handler(s, u, L);
     }
 
-    if (n != (ssize_t) query.len) {
+    if (n != (ssize_t) len) {
         dd("not the while query was sent");
 
         u->ft_type |= NGX_STREAM_LUA_SOCKET_FT_PARTIALWRITE;
@@ -1096,8 +1121,8 @@ ngx_stream_lua_socket_udp_receive(lua_State *L)
     ngx_stream_lua_srv_conf_t             *lscf;
 
     nargs = lua_gettop(L);
-    if (nargs != 1 && nargs != 2) {
-        return luaL_error(L, "expecting 1 or 2 arguments "
+    if (nargs < 1 || nargs > 3) {
+        return luaL_error(L, "expecting 1 - 3 arguments "
                           "(including the object), but got %d", nargs);
     }
 
@@ -1152,17 +1177,27 @@ ngx_stream_lua_socket_udp_receive(lua_State *L)
     size = ngx_min(size, UDP_MAX_DATAGRAM_SIZE);
 
     u->recv_buf_size = size;
+    u->recv_buf = ngx_stream_lua_socket_udp_buffer;
 
-    ngx_log_debug1(NGX_LOG_DEBUG_STREAM, s->connection->log, 0,
-                   "stream lua udp socket receive buffer size: %uz",
-                   u->recv_buf_size);
+    if (nargs == 3 && lua_type(L, 3) == LUA_TCDATA) {
+        u->recv_buf = *(u_char **)(lua_topointer(L, 3));
+        if (u->recv_buf == NULL) {
+            lua_pushnil(L);
+            lua_pushliteral(L, "invalid buffer");
+            return 2;
+        }
+    }
+
+    ngx_log_debug2(NGX_LOG_DEBUG_STREAM, s->connection->log, 0,
+                   "stream lua udp socket receive buffer size: %uz ptr: %p",
+                   u->recv_buf_size, u->recv_buf);
 
     c = u->udp_connection.connection;
 
     if (u->raw_downstream && !u->connected) {
         u->received = c->buffer->last - c->buffer->pos;
         c->buffer->pos =
-            ngx_copy(ngx_stream_lua_socket_udp_buffer, c->buffer->pos, u->received);
+            ngx_copy(u->recv_buf, c->buffer->pos, u->received);
         ngx_stream_lua_socket_udp_handle_success(s, u);
         u->connected = 1;
         rc = NGX_OK;
@@ -1222,7 +1257,11 @@ ngx_stream_lua_socket_udp_receive_retval_handler(ngx_stream_session_t *s,
         return ngx_stream_lua_socket_error_retval_handler(s, u, L);
     }
 
-    lua_pushlstring(L, (char *) ngx_stream_lua_socket_udp_buffer, u->received);
+    if (u->recv_buf == ngx_stream_lua_socket_udp_buffer) {
+        lua_pushlstring(L, (char *) u->recv_buf, u->received);
+    } else {
+        lua_pushinteger(L, u->received);
+    }
     return 1;
 }
 
@@ -1361,7 +1400,7 @@ ngx_stream_lua_socket_udp_read(ngx_stream_session_t *s,
                    (int) u->waiting);
 
     n = ngx_udp_recv(u->udp_connection.connection,
-                     ngx_stream_lua_socket_udp_buffer, u->recv_buf_size);
+                     u->recv_buf, u->recv_buf_size);
 
     ngx_log_debug1(NGX_LOG_DEBUG_STREAM, c->log, 0,
                    "stream lua udp recv returned %z", n);

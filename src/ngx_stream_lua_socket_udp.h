@@ -50,6 +50,7 @@ struct ngx_stream_lua_socket_udp_upstream_s {
     ngx_err_t                          socket_errno;
     size_t                             received; /* for receive */
     size_t                             recv_buf_size;
+    u_char                            *recv_buf;
 
     ngx_stream_lua_co_ctx_t           *co_ctx;
     unsigned                           raw_downstream:1;
